@@ -1,257 +1,30 @@
 <meta charset="utf-8" emacsmode="-*- markdown -*-">
 
-Solving Data-flow problems in syntax trees
+Selective Lambda Lifting
 
-# First slide
+# Motivation
 
-- (0:23)
-- Thanks for having me here and for this great opportunity to give a talk
-- I'm ...
-- originally, I planned to talk about my recently finished master's thesis
-- decided that's a talk I'd probably fall asleep to
-- so instead this will be about an interesting byproduct of my thesis that should be more fun to follow
+- What is lambda lifting?
+- Consider Haskell Code
+- LL will turn local function definitions into top-level ones, turning free variables into parameters
+- former free variables are additional arguments at call sites
+- Lambda lifting is famous as a code generation strategy for functional languages
+- But GHC currently does closure conversion, allocates a closure for g closing over a
+- Sometimes it's beneficial to do LL instead, as this example demonstrates (non-allocating), 50% speedup
+- Also examples that get substantially slower, like the following  
+  - Thunk for h, closes over g and n
+  - Lambda lifting gets rid of closure environment for g
+  - But h now closes over a b and n, so grew by one word
+  - Worse: g closure allocated once, but h closure allocated multiple times
+  - 10% slowdown
+- On Simon's wish list for quite some time
+- So I went ahead and implemented it
+- Goal of paper: work out when a lambda lift is beneficial
 
-# Introduction
+# Closure conversion vs. Lambda lifting
 
-- 2 minutes (1:17)
-- So, what exactly was my thesis about?
-- Two analyses in GHC, CA and DA, that overlap in concerns
-- I extracted overlapping logic into a combined Usage Analysis generalising CA and its counterpart in DA
-- Surprising result: Precision of CA achievable without co-call graphs
-- Now, if those words don't mean anything to you, fear not, you won't hear them again
-- Otherwise or if you are interested, I encourage you to skim through my master's thesis here
-- Marrying Call Arity with the Demand Analyser required quite a complex analysis order at let bindings
-- In particular, GHC's analyses are typically implemented as iterative traversals of the syntax tree
-- proved to be too restrictive
-- Had to decouple specification of data-flow problem from computing its solution
-- Sounds vague, I know
-- But we'll go over the details by the example of a strictness analysis
-
-# Strictness Analysis
-
-- 1 minute (1:07)
-- provides lower bounds on *evaluation cardinality*
-- Specifically, it answers the question of which variables are evaluated at least once
-- Answer to that captured in a property called the variables strictness
-- `Strict` is the analysis' way of saying 'Yes, I'm sure this is evaluated at least once'
-- While `Lazy` is the conservative 'Probably not, but I'm not really sure'
-- So for the example program below we can find out that:  
-  - `x` and `y` are evaluated strictly
-  - wheras `z` is evaluated lazily, because it won't be evaluated at all if `y` is odd
-- The compiler can take advantage of that knowledge by using Call by Value without changing the semantics
-- (bang patterns)
-- Also it could unbox strict variables
-
-# GHC's Demand Analyser
-
-- 1 minute (0:46)
-- GHC performs strictness analysis in its Demand Analyser
-- Strictness annotations are most important for the worker/wrapper transformation, which is responsible for unboxing
-- Demand Analysis works by:  
-  - Finding out, for each expression, which free variables are used strictly 
-  - and for each function which arguments are used strictly
-- Analysis information is captured in an expression's strictness type:  
-  - an environment for strictness on free variables
-  - a list of strictness indicators for arguments
-
-# Strictness signatures
-
-- 1 minute (0:58)
-- Interesting to see how a Strictness Analysis in the style of the Demand Analyser handles let-bindings
-- Demand Analysis annotates bindings with their strictness signature
-- This is the signature for `const`
-- We see that `const` does nothing interesting with free variables
-- but uses its first argument strictly, whereas its second argument is not used at all and thus lazily
-- At the call site we can unleash the strictness type stored in `const`s signature to see that `y` is used strictly and the `error` term is not
-- Now, the critical part is that
-- In order to have the strictness signature available at call sites, we have to analyse the RHS of the binding before the let body
-
-# Call Context matters 1
-
-- 2 minutes (2:30)
-- This restriction is unfortunate in cases like this
-- We'll focus on the free variable `z` here
-- `f` is called with two arguments
-- So the whole expression is strict in `z`
-- Our strictness analysis fails to recognise this
-- In order to have *some* signature available in the body, our analysis only computes the signature of `f` for manifest arity 1 (the number of leading lambdas)
-- Not enough information to look under the inner lambda bindings
-- Has to be conservative and assume `z` to be used lazily
-- Because of `seq` it may well be that a call to `f` does not evaluate `z` at all
-- But in the body, `f` is only ever called with two arguments
-- If we had known that we could have computed a more precise signature for that case
-
-# Call Context matters 2
-
-- Obviously, we can't just pre-compute signatures for all possible arities
-- The solution is to postpone analysis of the RHS until incoming arity is known
-- In this case:  
-  - Go straight into the body
-  - handle the call to `f` by analysing its RHS with the incoming arity 2
-  - In the resulting 'signature', `z` is detected as used strictly
-- Formally, what we are doing here is, we approximate the *strictness transformer* of the RHS in finitely many points  
-- The strictness transformer of an expression maps incoming arity to the appropriate strictness type
-- My first ideas to implement this tried to harness laziness in some clever way to cache strictness types
-
-# Recursion
-
-- 1 minute (1:12)
-- Turns out that this completely breaks down when handling recursive bindings
-- To compute the strictness type of the `fac`torial function called with one argument, we need the strictness type `fac` called with one argument
-- So I rediscovered fixed-point iteration, only that iteration order is no longer dictated by syntactic structure
-- To reiterate: Typical analyses within GHC would compute a stable approximation of the RHS, then analyse the body or vice versa
-- In constrast, we would descend into the body, then jump to the RHS, then jump back into the body 
-- This led me to declare analysis dependencies as a data-flow graph, solve it by worklist agorithm
-
-# Data-flow Graph for Strictness Analysis 1
-
-- 4 minutes (4:30)
-- How does this look, conceptually?
-- What nodes must be present in the graph we model the problem with?
-- We need one root node denoting the whole expression
-- Other than that, at the least we need to allocate nodes where we have to break recursion
-- One node per pair of let bound expression and incoming arity is sufficient
-- We initialise the worklist to only contain that root node
-- and assign all nodes a bottom value to start with
-
-# Data-flow Graph for Strictness Analysis 2
-
-1. Now we begin with actually computing a solution, by dequeing the first element of the worklist
-1. We invoke the transfer function of the root node and realise that it calls `f` with two arguments in its body  
-  - The respective node is $\bot$ and not yet present in the 'call stack'
-  - So analysis directly descends into the node, resembling depth-first search
-  - This makes sure that we discover the set of reachable nodes as quick as possible
-1. `f` recurses into itself in one of its branches  
-  - It does so with two arguments, as we analyse under the assumption of incoming arity two
-1. Our 'callstack' already contains `f2`  
-  - In order to break the dependency cycle, analysis doesn't recurse again
-  - Instead we assume the most optimistic strictness type possible
-  - which in this case corresponds to the following strictness type
-1. We note that `f2` depended on an unstable $\bot$ value by adding it to the worklist
-1. Under the assumption of this strictness type for the recursive case, we can join together the results from all three case branches  
-  - In the first branch, `f` is lazy in the second argument because of the call to `const`!
-  - Put together, we can update `f2`s node with this strictness type, that says
-1. With this potentially unstable approximation we jump back into the root node  
-  - Where we can unleash the strictness type at the call site of `f`
-  - To find out that the first argument `x` to `f` is used strictly, the second argument `y` lazily  
-1. Now we can dequeue the next item from the worklist, `f2`, where we needed to break a dependency clycle
-1. So we iterate `f2` again,
-1. Which again depends on itself  
-  - This time there is an approximation available, which we can use
-  - So under the assumption of this strictness type, we arrive at exactly the same strictness type
-  - Strictness type doesn't change, no further nodes need to be enqueued
-1. The worklist is empty and all nodes are stable, done!  
-  - By looking at the strictness type of the root node
-  - we can see that this expression uses its fv `x` strictly and `y` possibly lazily
-
-
-# Implementation 1
-
-- 3-4 minutes (2:59)
-- That's how we want to look things on the drawing board
-- How do we model this elegantly in Haskell?
-- My approach was to hide the iteration strategy behind an abstract `TransferFunction` monad  
-  - Parameterized by `k`, the type of nodes, and `v`, the denoting lattice
-- There's a single impure primitive in that monad: `dependOn`  
-  - Expresses a dependency on the node given as the first parameter
-  - Returns just the current value of the node
-  - Or `Nothing` if its value is currently $\bot$ and the iteration strategy decided to break a cycle
-  - In absence of any cycles, the employed iteration strategy just performs a single depth-first traversal
-- So that's how we specify a single transfer function
-
-# Implementation 2
-
-- The specification of a data-flow problem contains a transfer function for every node of the data-flow graph
-- as well as a `ChangeDetector` which captures the notion of efficiently testing lattice values for changes
-  - In the simplest case it's just equality from an `Eq`
-  - can make use of domain knowledge such as monotonicity
-  - Takes the node, the old value and the new value
-- Once a specification for the data-flow problem has been built
-
-# Implementation 3
-
-- The final step will be to pass this specification to `fixProblem`
-- `fixProblem` is an interpreter for `DataFlowProblem`s which computes a solution
-- It captures a certain iteration strategy
-- In our specific case:  
-  - Big picture: Iterate all nodes in the work list until they are stable
-  - Small tweak: Whenever we hit a $\bot$ node, we analyse it first
-  - On the initial graph, where all nodes are $\bot$, it's more like a 
-  - Depth-first traversal to discover the set of reachable nodes (e.g. the call graph)
-  - nodes end up in the worklist either because of broken cycles or because some dependency changed
-- The `fixProblem` function gets passed the `DataFlowProblem` as well as the initial worklist
-- The result is a map from nodes to stable denotations  
-  - Mostly the value of the root node is of interest
-
-# Applied to Strictness Analysis
-
-- (1:13)
-- When applied to strictness analysis, we want to denote expressions by their strictness transformer  
-  - that was the map from incoming arity to the corresponding strictness type
-- As we saw in the earlier example, we model the strictness transformer point-wise  
-  - so there is a strictness type per actual pair of `ExprNode` and `Arity`
-- Since `CoreExpr`s/`Id`s don't have an `Ord` instance, we need a separate `ExprNode` type for that  
-  - The order is important not only for indexing nodes in the graph, but also determines the priorities within the worklist
-  - Nodes need to be allocated as part of building the data-flow graph
-  - Possible to do so without leaking the details into the analysis logic
-  - Priorities of nodes should respect ordering given by the Occurence Analyser for good analysis performance
-
-# Comparison to hoopl
-
-- 2 minutes (2:13)
-- Everything that does data-flow analysis in Haskell should compare to hoopl  
-  - For anyone unaware, hoopl stands for 'higher-order optimisation library'
-  - is used in GHC's Cmm backend  
-- hoopl works on ordinary CFGs  
-  - For the better or the worse, our approach is much less restrictive
-  - We have seen how to allocate just the minimal number of nodes to break loops
-  - Could also allocate a node per subexpression
-  - Number of nodes more or less transparent to the analysis logic
-  - Allocation of more nodes results in higher degrees of caching but also more book-keeping
-  - Edges are declared in code through calls to `dependOn`
-  - discovered as transfer functions are executed
-- designed to handle imperative languages, hence CFG  
-  - whereas our approach is explicitly targeted at expression languages
-- In the same veign: hoopl has a rather operational model  
-  - Inputs flow into the begin of the basic block, through all instructions and out of the basic block
-  - Our approach is more denotational, giving meaning to a composite expression from its parts in some semantic domain  
-- Also, hoopl makes the join-semilattice explicit  
-  - in having the user specify a bottom value and a join operation
-  - which we should probably do too in order to share more analysis logic
-- Finally, hoopl is also concerned with a solution for transformations or rewrites 
-  - something we currently ignore
-  - messes with allocated nodes and their priorities
-
-# Discussion
-
-- 2 minutes (1:44)
-- Now for some pros and cons of my approach
-- From the plain standpoint of software engineering, separating analysis logic from iteration logic seems like the right thing to do
-- Although on the other hand, the coupling currently present in GHC's analysis is not as bad as when whipping up imperative analyses from scratch
-- Yet still, the interaction of different abstraction layers obscures intent  
-  - When reading through GHC's analysis code
-  - 'Is this relevant to analysis logic or just part of fixed-point iteration?'
-- As we saw earlier with the call context example, expressing analysis logic and iteration logic as a single iterated tree traversal also makes some ideas impossible to pursue
-- Also, optimisations to fixed-point iteration and other 'hacks', such as caching of analysis results between iterations, are encoded in the very nature of data-flow analysis  
-  - Iterating bindings in a beneficial order is abstracted in the worklist
-- However, it is unclear how compiler performance will be affected  
-  - Needs quite some book-keeping to update graph nodes and check for changes
-  - On the other hand, it promises even better caching and less performance bugs
-  - We can't really tell until we measure, which is on my TODO list for when the code is stable
-- Finally, extracting the shared concerns can only really shine if multiple analyses use this model
-
-# Conclusion
-
-- 1-2 minutes (1:33)
-- To wrap up
-- I pitched what I found to be an interesting idea that came out of my thesis
-- The theme was to separate specification of analysis logic from computing the solution of the underlying data-flow problem
-- We saw an example for how the solver would compute a stable solution by iterating the data-flow graph
-- Apologies if this was all a bit vague, but I have very concrete plans for the future:  
-  1. First, recall that for strictness analysis, we denoted expressions by their strictness transformer, which is a monotone function. Currently, we don't take advantage of that at all. What is needed for that to happen, is a map data-structure that is indexed by a partial order, so that we can have arbitrary lattices as keys. You can track my work in this repository
-  2. When we have the right data-structure, we need to find a proper way to integrate it into the API. We also need ways to express abortion and other frequent analysis hacks. After some polishing, I plan to actually publish it on hackage
-  3. Finally, we can testdrive it in different analyses within GHC and measure how it affects compiler performance
-- Even if performance turns out to be bad, I think the approach is probably worth to be considered in hobby projects or when prototyping
-
+- Both are code gen strategies that translate local functions in terms of global ones and auxiliary heap allocs
+- Closure Conversion: References to free variables lowered as fields accesses on a closure record containing all FVs
+- Lambda Lifting: Convert free variables into parameters, supplied as additional arguments at call sites
 
 <!-- Markdeep: --><style class="fallback">body{visibility:hidden;white-space:pre;font-family:monospace}</style><script src="markdeep.min.js"></script><script src="https://casual-effects.com/markdeep/latest/markdeep.min.js"></script><script>window.alreadyProcessedMarkdeep||(document.body.style.visibility="visible")</script>
