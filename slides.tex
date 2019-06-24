@@ -243,8 +243,8 @@ g' a b n = n : h
         \onslide<11>
         \hspace{0.4\textwidth}$\Big\Downarrow$ LL $\id{mapF}$
         \begin{haskell}
-          mapF []      = [];
-          mapF (x:xs') = f' x : mapF xs';
+          mapF' f []      = [];
+          mapF' f (x:xs') = f x : mapF' f xs';
           let f = \x -> 2*x
           in mapF' f [1..n]
         \end{haskell}
