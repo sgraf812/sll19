@@ -237,8 +237,8 @@ g' a b n = n : h
         \onslide<9>
         \hspace{0.4\textwidth}$\Big\Downarrow$ LL $\idf$
         \begin{haskell}
-          f' a b c d = a*b*c*d*x*y*z;
-          in f' x y z 1 2 3 4
+          f' x y z a b c d = a*b*c*d*x*y*z;
+          f' x y z 1 2 3 4
         \end{haskell}
         \onslide<11>
         \hspace{0.4\textwidth}$\Big\Downarrow$ LL $\id{mapF}$
